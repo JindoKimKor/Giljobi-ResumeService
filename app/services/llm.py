@@ -43,6 +43,19 @@ Return a JSON object with matched and missing skills:
 Resume:
 {resume_text}"""
 
+FORMAT_JD_PROMPT = """Reformat this raw job description into a clean, well-structured format.
+
+Rules:
+- Extract and clearly label: Role/Title, Location, Duration/Type, Required Experience, Tech Stack, Responsibilities, Requirements, Nice-to-haves
+- Only include sections that exist in the original — do not invent information
+- Use bullet points (- ) for lists, not bullets or asterisks
+- Keep it concise but complete
+
+Return ONLY the formatted text as Markdown. No JSON, no preamble.
+
+Raw job description:
+{description}"""
+
 ANALYSIS_PROMPT = """You are a career analyst. Given a candidate's skills, their match against a target job category, and a real job posting, provide:
 
 1. strengths: List of 2-4 bullet points about the candidate's strong areas relative to market demand
@@ -129,7 +142,16 @@ def reconcile_skills(resume_text: str, db_skills_by_category: dict[str, list[str
     return result
 
 
-# ── Prompt 3: Gap Analysis + JD Highlight (Stage 7) ──
+# ── Prompt 3: Format JD (Stage 6.5) ──
+
+def format_jd(description: str) -> str:
+    """Reformat a raw job description into clean Markdown."""
+    prompt = FORMAT_JD_PROMPT.format(description=description)
+    stdout = _call_claude(prompt)
+    return stdout.strip()
+
+
+# ── Prompt 4: Gap Analysis + JD Highlight (Stage 7) ──
 
 def generate_analysis(
     all_user_skills: list[str],

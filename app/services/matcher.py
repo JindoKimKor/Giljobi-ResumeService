@@ -97,10 +97,10 @@ def find_similar_nocs(conn, user_skills: list[str], seniority: str, exclude_noc:
     return [{"noc_code": r[0], "noc_name": r[1], "overlap": r[2], "match_rate": round(float(r[3]), 3) if r[3] else 0.0} for r in rows]
 
 
-def find_best_posting(conn, noc_code: str, seniority: str, user_skills: list[str]) -> dict | None:
-    """SPEC Query 3: 같은 NOC + seniority에서 스킬 overlap이 가장 큰 job posting."""
+def find_best_postings(conn, noc_code: str, seniority: str, user_skills: list[str], limit: int = 3) -> list[dict]:
+    """SPEC Query 3: 같은 NOC + seniority에서 스킬 overlap이 가장 큰 job postings (top N)."""
     if not user_skills:
-        return None
+        return []
 
     placeholders = ",".join(["%s"] * len(user_skills))
     cur = conn.cursor()
@@ -117,13 +117,11 @@ def find_best_posting(conn, noc_code: str, seniority: str, user_skills: list[str
           AND sk.name IN ({placeholders})
         GROUP BY p.job_id, c.name, p.raw_title, p.description
         ORDER BY skill_overlap DESC
-        LIMIT 1
-    """, [noc_code, seniority] + user_skills)
-    row = cur.fetchone()
+        LIMIT %s
+    """, [noc_code, seniority] + user_skills + [limit])
+    rows = cur.fetchall()
     cur.close()
-    if not row:
-        return None
-    return {"company": row[1], "title": row[2], "description": row[3], "skill_overlap": row[4]}
+    return [{"company": r[1], "title": r[2], "description": r[3], "skill_overlap": r[4]} for r in rows]
 
 
 def noc_exists(conn, noc_code: str) -> bool:

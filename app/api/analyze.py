@@ -10,10 +10,10 @@ import json
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.services.validation import validate_input, ValidationError
-from app.services.llm import extract_skills, reconcile_skills, generate_analysis, LLMError
+from app.services.llm import extract_skills, reconcile_skills, format_jd, generate_analysis, LLMError
 from app.services.matcher import (
     get_noc_required_skills, group_skills_by_category, calculate_match_rate,
-    find_similar_nocs, find_best_posting, noc_exists,
+    find_similar_nocs, find_best_postings, noc_exists,
 )
 from app.db.neon import get_sd_connection
 
@@ -169,26 +169,44 @@ async def analyze_resume(ws: WebSocket):
             similar = find_similar_nocs(conn, user_skills_free, target_seniority, target_noc_code)
             await send_stage(ws, {"stage": "similar_nocs", "top5": similar})
 
-            # ── Stage 6: DB — Best posting (same NOC + seniority) ──
+            # ── Stage 6: DB — Best postings (same NOC + seniority, top 3) ──
             await send_stage(ws, {"stage": "finding_posting"})
-            posting = find_best_posting(conn, target_noc_code, target_seniority, user_skills_free)
-            if posting:
-                await send_stage(ws, {
-                    "stage": "best_posting",
-                    "company": posting["company"],
-                    "title": posting["title"],
-                    "description": posting["description"][:2000],
-                    "skill_overlap": posting["skill_overlap"],
+            postings = find_best_postings(conn, target_noc_code, target_seniority, user_skills_free, limit=3)
+            print(f"[WS] Best postings: {len(postings)} found", flush=True)
+            postings_data = []
+            for p in postings:
+                postings_data.append({
+                    "company": p["company"],
+                    "title": p["title"],
+                    "description": p["description"][:2000],
+                    "skill_overlap": p["skill_overlap"],
                 })
-            else:
+            await send_stage(ws, {
+                "stage": "best_postings",
+                "postings": postings_data,
+            })
+
+            # ── Stage 6.5: LLM #3 — JD 포맷팅 (individual calls) ──
+            formatted_jds = []
+            if postings_data:
+                await send_stage(ws, {"stage": "formatting_jd"})
+                for i, p in enumerate(postings_data):
+                    try:
+                        fmt = format_jd(p["description"])
+                        formatted_jds.append(fmt)
+                        print(f"[WS] JD #{i+1} formatted: {len(fmt)} chars", flush=True)
+                    except LLMError as e:
+                        print(f"[WS] JD #{i+1} format failed (non-fatal): {e}", flush=True)
+                        formatted_jds.append("")
                 await send_stage(ws, {
-                    "stage": "best_posting",
-                    "company": None, "title": None,
-                    "description": "No matching job posting found",
-                    "skill_overlap": 0,
+                    "stage": "formatted_jd",
+                    "formatted_jds": formatted_jds,
                 })
 
-            # ── Stage 7: LLM #3 — 종합 분석 ──
+            # Use top posting for career analysis
+            top_posting = postings[0] if postings else None
+
+            # ── Stage 7: LLM #4 — 종합 분석 ──
             await send_stage(ws, {"stage": "analyzing"})
             try:
                 analysis = generate_analysis(
@@ -197,9 +215,9 @@ async def analyze_resume(ws: WebSocket):
                     matched_skills=matched_skills,
                     missing_skills=missing_skills,
                     match_rate=match_rate,
-                    company=posting["company"] if posting else "N/A",
-                    title=posting["title"] if posting else "N/A",
-                    description=posting["description"][:2000] if posting else "No matching posting found",
+                    company=top_posting["company"] if top_posting else "N/A",
+                    title=top_posting["title"] if top_posting else "N/A",
+                    description=top_posting["description"][:2000] if top_posting else "No matching posting found",
                 )
             except LLMError as e:
                 await send_error(ws, "LLM_FAILED", str(e))
@@ -209,7 +227,6 @@ async def analyze_resume(ws: WebSocket):
                 "strengths": analysis.get("strengths", []),
                 "gaps": analysis.get("gaps", []),
                 "recommendations": analysis.get("recommendations", ""),
-                "jd_highlighted": analysis.get("jd_highlighted", ""),
             })
 
             # ── Stage 8: Done ──
