@@ -29,27 +29,40 @@ def calculate_match_rate(user_skills: list[str], required_skills: list[str]) -> 
 
 
 def get_noc_required_skills(conn, noc_code: str, seniority: str) -> list[dict]:
-    """SPEC Query 1: Target NOC 요구 스킬."""
+    """SPEC Stage 1: Target NOC 요구 스킬 (category별 top 10)."""
     cur = conn.cursor()
     cur.execute("""
-        SELECT sk.name, sk.category, COUNT(*) as demand_count
-        FROM fact_job_skill_demand f
-        JOIN fact_job_postings p ON f.job_id = p.job_id
-        JOIN dim_skills sk ON f.skill_id = sk.id
-        JOIN dim_seniority ds ON p.seniority_id = ds.id
-        WHERE p.noc_id = (SELECT id FROM noc_titles WHERE noc21_code = %s)
-          AND ds.level = %s
-        GROUP BY sk.name, sk.category
-        ORDER BY demand_count DESC
-        LIMIT 30
+        SELECT name, category, demand_count FROM (
+          SELECT sk.name, sk.category, COUNT(*) as demand_count,
+                 ROW_NUMBER() OVER (PARTITION BY sk.category ORDER BY COUNT(*) DESC) as rn
+          FROM fact_job_skill_demand f
+          JOIN fact_job_postings p ON f.job_id = p.job_id
+          JOIN dim_skills sk ON f.skill_id = sk.id
+          JOIN dim_seniority ds ON p.seniority_id = ds.id
+          WHERE p.noc_id = (SELECT id FROM noc_titles WHERE noc21_code = %s)
+            AND ds.level = %s
+          GROUP BY sk.name, sk.category
+        ) ranked WHERE rn <= 15
+        ORDER BY category, demand_count DESC
     """, (noc_code, seniority))
     rows = cur.fetchall()
     cur.close()
     return [{"name": r[0], "category": r[1], "demand_count": r[2]} for r in rows]
 
 
-def find_similar_nocs(conn, user_skills: list[str]) -> list[dict]:
-    """SPEC Query 2: 전체 NOC 유사도 (user skills 교집합)."""
+def group_skills_by_category(skills: list[dict]) -> dict[str, list[str]]:
+    """Group skill list into {category: [name, ...]} for LLM prompt."""
+    grouped = {}
+    for s in skills:
+        cat = s["category"]
+        if cat not in grouped:
+            grouped[cat] = []
+        grouped[cat].append(s["name"])
+    return grouped
+
+
+def find_similar_nocs(conn, user_skills: list[str], seniority: str, exclude_noc: str) -> list[dict]:
+    """SPEC Query 2: 같은 seniority의 다른 NOC 유사도 (target NOC 제외)."""
     if not user_skills:
         return []
 
@@ -62,25 +75,30 @@ def find_similar_nocs(conn, user_skills: list[str]) -> list[dict]:
         FROM fact_job_skill_demand f
         JOIN fact_job_postings p ON f.job_id = p.job_id
         JOIN dim_skills sk ON f.skill_id = sk.id
+        JOIN dim_seniority ds ON p.seniority_id = ds.id
         JOIN noc_titles n ON p.noc_id = n.id
         LEFT JOIN (
             SELECT p2.noc_id, COUNT(DISTINCT f2.skill_id) as cnt
             FROM fact_job_skill_demand f2
             JOIN fact_job_postings p2 ON f2.job_id = p2.job_id
+            JOIN dim_seniority ds2 ON p2.seniority_id = ds2.id
+            WHERE ds2.level = %s
             GROUP BY p2.noc_id
         ) total ON total.noc_id = p.noc_id
         WHERE sk.name IN ({placeholders})
+          AND ds.level = %s
+          AND n.noc21_code != %s
         GROUP BY n.noc21_code, n.noc21_name, total.cnt
         ORDER BY match_rate DESC
         LIMIT 5
-    """, user_skills)
+    """, [seniority] + user_skills + [seniority, exclude_noc])
     rows = cur.fetchall()
     cur.close()
     return [{"noc_code": r[0], "noc_name": r[1], "overlap": r[2], "match_rate": round(float(r[3]), 3) if r[3] else 0.0} for r in rows]
 
 
-def find_best_posting(conn, noc_code: str, user_skills: list[str]) -> dict | None:
-    """SPEC Query 3: 가장 유사한 job posting."""
+def find_best_posting(conn, noc_code: str, seniority: str, user_skills: list[str]) -> dict | None:
+    """SPEC Query 3: 같은 NOC + seniority에서 스킬 overlap이 가장 큰 job posting."""
     if not user_skills:
         return None
 
@@ -91,14 +109,16 @@ def find_best_posting(conn, noc_code: str, user_skills: list[str]) -> dict | Non
                COUNT(*) as skill_overlap
         FROM fact_job_postings p
         JOIN dim_companies c ON p.company_id = c.id
+        JOIN dim_seniority ds ON p.seniority_id = ds.id
         JOIN fact_job_skill_demand f ON f.job_id = p.job_id
         JOIN dim_skills sk ON f.skill_id = sk.id
         WHERE p.noc_id = (SELECT id FROM noc_titles WHERE noc21_code = %s)
+          AND ds.level = %s
           AND sk.name IN ({placeholders})
         GROUP BY p.job_id, c.name, p.raw_title, p.description
         ORDER BY skill_overlap DESC
         LIMIT 1
-    """, [noc_code] + user_skills)
+    """, [noc_code, seniority] + user_skills)
     row = cur.fetchone()
     cur.close()
     if not row:

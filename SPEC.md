@@ -322,19 +322,58 @@ Frontend                          Resume Service (ACA)
    ├─ WS connect ──────────────────────▶ │
    ├─ send: {resume, seniority, noc} ──▶ │
    │                                     │
-   │  ◀── {"stage": "extracting"}        ├─ 1. Claude CLI: resume → skills
-   │  ◀── {"stage": "extracted", ...}    │
-   │  ◀── {"stage": "matching_noc"}      ├─ 2. DB: target NOC 스킬 비교
+   │  ◀── {"stage": "loading_skills"}    ├─ 1. DB: target NOC 스킬 조회 (category별 top 10)
+   │  ◀── {"stage": "noc_skills", ...}   │
+   │                                     │
+   │  ◀── {"stage": "extracting"}        ├─ 2. LLM #1: resume → 자유 스킬 추출
+   │  ◀── {"stage": "extracted", ...}    │     + inflect 단수화 (DataPipeline과 동일)
+   │                                     │
+   │  ◀── {"stage": "reconciling"}       ├─ 3. LLM #2: resume + DB 스킬 목록 → reconcile
+   │  ◀── {"stage": "reconciled", ...}   │     "이 목록 중 보유한 것을 골라줘"
+   │                                     │
+   │  ◀── {"stage": "matching_noc"}      ├─ 4. Match rate 계산 (DB 이름 기준 exact match)
    │  ◀── {"stage": "noc_match", ...}    │
-   │  ◀── {"stage": "finding_similar"}   ├─ 3. DB: 전체 NOC 유사도
+   │                                     │
+   │  ◀── {"stage": "finding_similar"}   ├─ 5. DB: 전체 NOC 유사도
    │  ◀── {"stage": "similar_nocs", ...} │
-   │  ◀── {"stage": "finding_posting"}   ├─ 4. DB: 가장 유사한 job posting
+   │                                     │
+   │  ◀── {"stage": "finding_posting"}   ├─ 6. DB: 가장 유사한 job posting
    │  ◀── {"stage": "best_posting", ...} │
-   │  ◀── {"stage": "analyzing"}         ├─ 5. Claude CLI: 종합 분석
+   │                                     │
+   │  ◀── {"stage": "analyzing"}         ├─ 7. LLM #3: 종합 분석 + JD 하이라이트
    │  ◀── {"stage": "analysis", ...}     │
+   │                                     │
    │  ◀── {"stage": "done"}              │
    └─ WS close ─────────────────────────┘
 ```
+
+### Stage Detail
+
+**Stage 1 — DB: NOC 스킬 조회**
+- target NOC + seniority로 DB 쿼리
+- category별 top 10 (hard_skill 10, soft_skill 10, tool 10, certification 10)
+- 이 목록이 Stage 3 reconcile의 기준이 됨
+
+**Stage 2 — LLM #1: 자유 스킬 추출**
+- resume 텍스트만 주고 자유롭게 추출
+- inflect 단수화 적용 (DataPipeline `step4_load.py`의 `normalize_skills()`와 동일)
+- 결과: user의 전체 스킬 목록 (DB 이름과 무관)
+
+**Stage 3 — LLM #2: Reconcile (DB 스킬 목록과 대조)**
+- resume + DB 스킬 목록(Stage 1)을 같이 주고
+- "이 목록의 스킬 중에서 이 resume에 해당하는 것을 정확히 골라줘"
+- LLM이 DB에 있는 이름 그대로 반환 → exact match 보장
+- 결과: matched_skills (DB 이름), missing_skills (DB 이름)
+
+**Stage 4 — Match rate 계산**
+- Stage 3의 matched/missing로 비율 계산
+- DB 이름 기준이라 불일치 없음
+
+**Stage 5~6 — DB 쿼리** (기존과 동일)
+
+**Stage 7 — LLM #3: 종합 분석**
+- Stage 2(자유 추출) + Stage 3(reconcile 결과) + Stage 6(best posting)을 context로
+- strengths, gaps, recommendations, jd_highlighted 생성
 
 ---
 
@@ -463,9 +502,9 @@ GET /noc-list
 
 ---
 
-## LLM Prompts
+## LLM Prompts (3 calls)
 
-### Prompt 1: Resume → Skills Extraction
+### Prompt 1: Free Skill Extraction (Stage 2)
 
 ```
 Extract all technical skills, tools, and certifications from this resume.
@@ -479,9 +518,39 @@ Resume:
 
 **Expected output:** `["python", "aws", "docker", ...]`
 **Parse:** `json.loads(stdout)` → `List[str]`
+**Post-process:** inflect 단수화 (DataPipeline과 동일 — "kubernetes"→"kubernete" 같은 건 KEEP_PLURAL로 보호)
 **Failure mode:** If not valid JSON array → `LLM_FAILED`
 
-### Prompt 2: Gap Analysis + JD Highlight
+### Prompt 2: Reconcile against DB skills (Stage 3)
+
+```
+Given a resume and a list of skills from a job category database, identify which skills the candidate has.
+
+IMPORTANT: Return ONLY skills from the provided list. Use the EXACT names from the list.
+Do not add skills that are not in the list. Do not modify skill names.
+
+Skills list (from database):
+Hard Skills: {hard_skills}
+Soft Skills: {soft_skills}
+Tools: {tools}
+Certifications: {certifications}
+
+Return a JSON object with matched and missing skills:
+{
+  "matched": ["skill1", "skill2", ...],
+  "missing": ["skill3", "skill4", ...]
+}
+
+Resume:
+{resume_text}
+```
+
+**Expected output:** `{"matched": [...], "missing": [...]}`
+**Parse:** `json.loads(stdout)` → `dict`
+**Key guarantee:** matched + missing = 전체 DB 스킬 목록 (빠짐없이)
+**Failure mode:** If not valid JSON → `LLM_FAILED`
+
+### Prompt 3: Gap Analysis + JD Highlight (Stage 7)
 
 ```
 You are a career analyst. Given a candidate's skills, their match against a target job category, and a real job posting, provide:
@@ -499,11 +568,10 @@ Return as JSON:
   "jd_highlighted": "..."
 }
 
-Candidate skills: {user_skills}
-Target NOC: {noc_name} ({noc_code})
+Candidate's extracted skills (free extraction): {all_user_skills}
+Matched against DB ({noc_name}): {matched_skills}
+Missing from DB: {missing_skills}
 Match rate: {match_rate}
-Matched skills: {matched_skills}
-Missing skills: {missing_skills}
 
 Best matching job posting:
 Company: {company}
@@ -540,17 +608,20 @@ parsed = json.loads(json_match.group())
 ## DB 쿼리 (Resume Service가 직접 실행)
 
 ```sql
--- Section 1: Target NOC 요구 스킬 (seniority 필터)
-SELECT sk.name, sk.category, COUNT(*) as demand_count
-FROM fact_job_skill_demand f
-JOIN fact_job_postings p ON f.job_id = p.job_id
-JOIN dim_skills sk ON f.skill_id = sk.id
-JOIN dim_seniority ds ON p.seniority_id = ds.id
-WHERE p.noc_id = (SELECT id FROM noc_titles WHERE noc21_code = :noc_code)
-  AND ds.level = :seniority
-GROUP BY sk.name, sk.category
-ORDER BY demand_count DESC
-LIMIT 30;
+-- Stage 1: Target NOC 요구 스킬 (category별 top 10, seniority 필터)
+-- ROW_NUMBER로 각 category에서 top 10만 추출
+SELECT name, category, demand_count FROM (
+  SELECT sk.name, sk.category, COUNT(*) as demand_count,
+         ROW_NUMBER() OVER (PARTITION BY sk.category ORDER BY COUNT(*) DESC) as rn
+  FROM fact_job_skill_demand f
+  JOIN fact_job_postings p ON f.job_id = p.job_id
+  JOIN dim_skills sk ON f.skill_id = sk.id
+  JOIN dim_seniority ds ON p.seniority_id = ds.id
+  WHERE p.noc_id = (SELECT id FROM noc_titles WHERE noc21_code = :noc_code)
+    AND ds.level = :seniority
+  GROUP BY sk.name, sk.category
+) ranked WHERE rn <= 10
+ORDER BY category, demand_count DESC;
 
 -- Section 2: 전체 NOC 유사도 (내 스킬과 교집합)
 SELECT n.noc21_code, n.noc21_name,
@@ -587,14 +658,20 @@ LIMIT 1;
 
 ---
 
-## LLM 호출 (2회)
+## LLM 호출 (3회)
 
-| # | 목적 | Input | Output |
-|---|------|-------|--------|
-| 1 | Resume → skills 추출 | resume text | `["python", "aws", ...]` |
-| 2 | 종합 분석 생성 | resume skills + DB 매칭 결과 + best JD | strengths, gaps, recommendations, JD highlight |
+| # | Stage | 목적 | Input | Output |
+|---|-------|------|-------|--------|
+| 1 | 2 | 자유 스킬 추출 | resume text | `["python", "aws", ...]` |
+| 2 | 3 | DB 스킬 reconcile | resume + DB 스킬 목록 (category별 top 10) | `{"matched": [...], "missing": [...]}` |
+| 3 | 7 | 종합 분석 생성 | 전체 context (자유 추출 + reconcile + best JD) | strengths, gaps, recommendations, JD highlight |
 
-매칭 계산 자체는 DB 쿼리 — LLM은 추출과 분석 텍스트 생성에만 사용.
+**왜 3회인가:**
+- Prompt 1 (자유 추출): resume에 어떤 스킬이 있는지 파악 — DB에 없는 스킬도 포함
+- Prompt 2 (reconcile): DB 이름 기준으로 exact match 보장 — "이 목록에서 골라줘"
+- Prompt 3 (분석): 두 결과를 종합해서 인사이트 생성
+
+Prompt 1과 2를 합치면 안 되는 이유: 자유 추출 결과는 similar NOCs 쿼리에 사용되고, reconcile 결과는 target NOC match rate에 사용됨. 목적이 다름.
 
 ---
 

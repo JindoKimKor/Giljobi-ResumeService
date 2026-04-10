@@ -32,5 +32,7 @@ WORKDIR /app
 
 EXPOSE 8000
 
+# PYTHONUNBUFFERED: print() goes to docker logs immediately (no buffering)
 # --ws-ping-interval/timeout: LLM calls take 30-60s, default 20s ping causes disconnect
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--ws-ping-interval", "60", "--ws-ping-timeout", "120"]
+ENV PYTHONUNBUFFERED=1
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--ws-ping-interval", "60", "--ws-ping-timeout", "120", "--log-level", "info"]
