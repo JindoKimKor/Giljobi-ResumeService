@@ -6,3 +6,13 @@ __pycache__/
 dist/
 build/
 *.pdf
+
+# Terraform
+*.tfstate
+*.tfstate.*
+*.tfvars
+.terraform/
+.terraform.lock.hcl
+
+# Claude credentials (baked into deploy image only)
+.claude/
